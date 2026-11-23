@@ -39,7 +39,6 @@ About 91% pixel accuracy and 0.36 layer mean error (~0.12 nm) on synthetic test 
 - oxide thickness is fixed at 285 nm, and a ±10 nm change shifts colours more than one extra layer does
 - optics assume white light at normal incidence, no real lamp/camera response
 - refractive indices are constants (MoS2 especially is off)
-- flakes are smooth blobs, max 4 layers, so thick flakes get misclassified
 - images are resized to 128x128 instead of tiled
 
 Plan is to randomise those in training and fine-tune on a few real labelled images per microscope.
