@@ -5,13 +5,19 @@ Turns the per-layer physics from `optics.py` into training data.
 
 Two datasets are provided:
 
-1. SyntheticFlakes: generates labelled microscope-style scenes on the fly .
+1. SyntheticFlakes -- generates labelled microscope-style scenes on the fly using
+   the Fresnel colour model plus realistic nuisances (illumination gradients,
+   vignetting, sensor noise, defocus blur, colour jitter). Each pixel's label is
+   the integer number of layers (0 = bare substrate). Deterministic per index and
+   split so train/val/test never share a scene (leakage-safe).
 
-2. RealFlakes: an images/folder of RGB pictures
-   and a masks/folder of single-channel PNGs whose pixel values ARE the layer
-   count (0,1,2,...). Use this once you have annotated microscope images. uSe any color by
-   number too online.
-   
+2. RealFlakes -- drop-in loader for real data: an images/ folder of RGB pictures
+   and a masks/ folder of single-channel PNGs whose pixel values ARE the layer
+   count (0,1,2,...). Use this once you have annotated microscope images.
+
+Flake terraces are produced as level sets of a convex-polygon field, which yields
+the straight-edged, angular, nested step structure that real exfoliated flakes
+show (they cleave along crystal directions, so edges meet at ~60/120 deg).
 """
 
 from __future__ import annotations
@@ -40,7 +46,10 @@ def to_chw_tensor(img_hwc: np.ndarray) -> torch.Tensor:
 #  Synthetic scene generation                                                  #
 # --------------------------------------------------------------------------- #
 def _blob_field(rng, H, W, n_centres):
-    """Smooth field in [0,1] from a sum of rotated 2D Gaussians."""
+    """Smooth field in [0,1] from a sum of rotated 2D Gaussians.
+
+    Used for the low-frequency illumination field (which really is smooth).
+    """
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     f = np.zeros((H, W), np.float32)
     for _ in range(n_centres):
@@ -52,6 +61,43 @@ def _blob_field(rng, H, W, n_centres):
         f += np.exp(-0.5 * ((xr / sx) ** 2 + (yr / sy) ** 2))
     f /= f.max() + 1e-9
     return f
+
+
+def _polygon_field(rng, H, W):
+    """Angular field in [0,1] shaped like a real exfoliated flake.
+
+    Builds a random convex polygon whose edges point along crystallographic
+    directions (normals spaced 60 deg apart, optionally also the 30-deg-rotated
+    set), each pushed a random distance from the centre so the polygon is
+    irregular but straight-edged with sharp corners. The returned field is the
+    inset distance from the edges: high in the middle, zero on the boundary.
+
+    Thresholding this field at several levels (as make_scene does) yields nested,
+    straight-edged terraces -- the stepped, angular look real flakes have, instead
+    of smooth blobs.
+    """
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    cy = rng.uniform(0.32, 0.68) * H
+    cx = rng.uniform(0.32, 0.68) * W
+    th0 = rng.uniform(0.0, np.pi / 3.0)                 # random orientation (60 deg periodic)
+    size = rng.uniform(0.18, 0.34) * min(H, W)          # overall flake radius
+
+    # Edge normals: a hexagonal set (60 deg apart); half the time also add the
+    # 30-deg-rotated set, giving up-to-12-sided straight-edged flakes.
+    angles = [th0 + k * (np.pi / 3.0) for k in range(6)]
+    if rng.random() < 0.5:
+        angles += [th0 + np.pi / 6.0 + k * (np.pi / 3.0) for k in range(6)]
+
+    field = np.full((H, W), 1e9, np.float32)
+    for a in angles:
+        ux, uy = np.cos(a), np.sin(a)
+        r = size * rng.uniform(0.55, 1.0)               # this edge's distance from centre
+        d = r - ((xx - cx) * ux + (yy - cy) * uy)       # > 0 inside this half-plane
+        field = np.minimum(field, d)                    # inside ALL edges = the polygon
+
+    field = np.clip(field, 0.0, None)
+    field /= field.max() + 1e-9
+    return field
 
 
 def _illumination(rng, H, W):
@@ -75,9 +121,9 @@ def make_scene(rng, size, max_layers, colors):
     H = W = size
     label = np.zeros((H, W), np.int64)
 
-    # 1..3 flakes, each a stack of terraces via level sets of a blob field.
+    # 1..3 flakes, each a stack of terraces via level sets of a polygon field.
     for _ in range(rng.integers(1, 4)):
-        g = _blob_field(rng, H, W, n_centres=rng.integers(1, 3))
+        g = _polygon_field(rng, H, W)                  # straight-edged, angular flake
         n_terr = int(rng.integers(1, max_layers + 1))
         # thresholds: higher field -> more layers (nested terraces)
         thr = np.sort(rng.uniform(0.30, 0.90, size=n_terr))[::-1]
